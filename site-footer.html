@@ -1,0 +1,346 @@
+<!-- ================================================================
+     LIVE PHOTO — Ghost Video Card Behavior (v5)
+     Detects short videos (≤5s) in Ghost Video cards and plays them
+     when scrolled into view — "photos that breathe."
+
+     Architecture:
+       Two IntersectionObservers:
+         1. Preload observer (rootMargin: 100% viewport) — switches
+            preload from "none" to "auto" as video approaches. Fires
+            once, then unobserves. Videos don't download on page load.
+         2. Play observer (threshold: 0.5) — plays when 50% visible,
+            pauses when scrolled away. Clears pending loop timeouts
+            on exit.
+
+       Mid-anchored crossfade (350ms, Web Animations API):
+         - Poster overlay created ONCE, kept in DOM, opacity toggled
+         - Start: overlay fades out with blur while video plays
+           simultaneously underneath — fully inset, no added time
+         - End: timeupdate triggers fade-in 350ms before video ends.
+           Overlay fades in over live motion, no hard cut.
+         - .finished promise for sequencing, fill: 'forwards' holds state
+         - will-change: opacity on overlay for GPU compositing
+
+       Loop with dwell:
+         - Detected via video loop attribute (Ghost's Loop toggle)
+         - Attribute is captured then removed — we manage looping
+         - After ended: fade in overlay → dwell 2.5s → replay cycle
+         - Scroll away cancels pending dwell timeout
+         - Scroll back starts fresh cycle
+
+       Poster source:
+         Ghost sets the video poster attribute to a transparent spacer
+         GIF (spacergif.org). The real thumbnail is on the <figure>
+         element as data-kg-custom-thumbnail or data-kg-thumbnail.
+
+       Other:
+         - NO cloneNode(). Safari breaks autoplay on moved elements.
+         - NO video.load(). Resets readyState, re-downloads video.
+         - Both video.muted (runtime) and setAttribute('muted') (HTML
+           attribute / defaultMuted) set for Safari autoplay policy.
+         - prefers-reduced-motion respected in real time.
+         - DOM references cached on video._livePhotoRefs.
+         - Transformed videos tracked in array (no DOM re-query).
+
+     Companion CSS in Site Header hides Ghost's player chrome.
+     ================================================================ -->
+<script>
+(function () {
+  'use strict';
+
+  var LIVE_PHOTO_MAX_DURATION = 5;
+  var FADE_DURATION = 350;
+  var FADE_EASING = 'ease';
+  var LOOP_DWELL = 4000; // ms to hold the still between loops
+
+  var prefersReducedMotion = window.matchMedia(
+    '(prefers-reduced-motion: reduce)'
+  ).matches;
+
+  // Track all transformed videos for reduced motion toggle
+  var livePhotos = [];
+
+  // --- Observer 1: Preload ---
+  // Starts video download when one viewport height away.
+  // Fires once per video, then unobserves.
+  var preloadObserver = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (entry.isIntersecting) {
+        entry.target.setAttribute('preload', 'auto');
+        preloadObserver.unobserve(entry.target);
+      }
+    });
+  }, { rootMargin: '100% 0px', threshold: 0 });
+
+  // --- Observer 2: Playback ---
+  // Plays when 50% visible, pauses when scrolled away.
+  var playObserver = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (prefersReducedMotion) return;
+
+      var video = entry.target;
+      var refs = video._livePhotoRefs;
+      if (!refs) return;
+
+      if (entry.isIntersecting) {
+        startPlayCycle(video);
+      } else {
+        cancelPendingLoop(refs);
+        video.pause();
+      }
+    });
+  }, { threshold: 0.5 });
+
+  function isShortVideo(video) {
+    var duration = video.duration;
+    return !isNaN(duration) && isFinite(duration) && duration <= LIVE_PHOTO_MAX_DURATION;
+  }
+
+  // --- Crossfade helpers (Web Animations API) ---
+  // Returns .finished promise. fill: 'forwards' holds final opacity.
+  // Blur on fade-out creates the "coming alive" dissolve effect.
+
+  function fadeOutOverlay(overlay) {
+    if (!overlay) return Promise.resolve();
+    return overlay.animate(
+      [
+        { opacity: 1, filter: 'blur(0px)' },
+        { opacity: 0, filter: 'blur(6px)' }
+      ],
+      { duration: FADE_DURATION, easing: FADE_EASING, fill: 'forwards' }
+    ).finished;
+  }
+
+  function fadeInOverlay(overlay) {
+    if (!overlay) return Promise.resolve();
+    return overlay.animate(
+      [
+        { opacity: 0, filter: 'blur(4px)' },
+        { opacity: 1, filter: 'blur(0px)' }
+      ],
+      { duration: FADE_DURATION, easing: FADE_EASING, fill: 'forwards' }
+    ).finished;
+  }
+
+  // --- Play cycle: fully inset crossfade ---
+  // Video plays and overlay fades simultaneously. The crossfade is
+  // fully inset — no time added. The still softens and dissolves
+  // into motion that's already happening underneath.
+  function startPlayCycle(video) {
+    var refs = video._livePhotoRefs;
+    if (!refs) return;
+
+    refs.fadingIn = false;
+    cancelPendingLoop(refs);
+
+    fadeOutOverlay(refs.overlay);
+    video.currentTime = 0;
+    video.play().catch(function () {});
+  }
+
+  // --- Loop management ---
+  function cancelPendingLoop(refs) {
+    if (refs.loopTimeout) {
+      clearTimeout(refs.loopTimeout);
+      refs.loopTimeout = null;
+    }
+  }
+
+  function transformLivePhoto(video) {
+    var card = video.closest('.kg-video-card');
+    if (!card) return;
+    if (card.classList.contains('live-photo')) return;
+
+    var container = card.querySelector('.kg-video-container');
+    card.classList.add('live-photo');
+
+    // --- Detect loop before we strip the attribute ---
+    // Ghost adds loop attribute when the Loop toggle is on.
+    var shouldLoop = video.hasAttribute('loop');
+
+    // --- Video attributes ---
+    // Both property and attribute set deliberately.
+    // video.muted sets runtime state. setAttribute('muted') sets
+    // defaultMuted via HTML attribute — Safari checks this at parse
+    // time for autoplay policy compliance.
+    video.muted = true;
+    video.setAttribute('muted', '');
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.loop = false;
+    video.removeAttribute('loop');
+    video.removeAttribute('autoplay');
+    video.autoplay = false;
+
+    // Start with preload="none" — preload observer switches to
+    // "auto" when the video approaches the viewport.
+    video.setAttribute('preload', 'none');
+
+    // --- Container setup (once) ---
+    if (container) {
+      container.style.position = 'relative';
+    }
+
+    // --- Create persistent poster overlay (once) ---
+    // Stays in DOM permanently. Opacity toggled for crossfade.
+    // Ghost sets the video poster attribute to a transparent spacer
+    // GIF. The real thumbnail is on the <figure> as data attributes.
+    var overlay = null;
+    var posterSrc = card.getAttribute('data-kg-custom-thumbnail')
+        || card.getAttribute('data-kg-thumbnail')
+        || video.getAttribute('poster');
+    if (posterSrc && container) {
+      overlay = document.createElement('img');
+      overlay.src = posterSrc;
+      overlay.alt = '';
+      overlay.setAttribute('data-live-photo-overlay', '');
+      overlay.style.cssText =
+        'position:absolute;top:0;left:0;width:100%;height:100%;' +
+        'object-fit:cover;z-index:1;opacity:1;' +
+        'will-change:opacity;pointer-events:none;';
+      container.appendChild(overlay);
+    }
+
+    // --- Cache DOM references on the video element ---
+    video._livePhotoRefs = {
+      card: card,
+      container: container,
+      overlay: overlay,
+      shouldLoop: shouldLoop,
+      fadingIn: false,      // guard against duplicate timeupdate fades
+      loopTimeout: null     // setTimeout ID for dwell between loops
+    };
+
+    // --- Track for reduced motion listener ---
+    livePhotos.push(video);
+
+    // --- Click/tap handler ---
+    // Capturing phase blocks Ghost's delegated play/pause toggle.
+    if (container) {
+      container.addEventListener('click', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        if (prefersReducedMotion) return;
+
+        startPlayCycle(video);
+      }, true);
+    }
+
+    // --- Timeupdate: fade overlay in before video ends ---
+    // Starts the fade-in during the final FADE_DURATION ms of playback
+    // so the motion gradually freezes into the still. By the time
+    // 'ended' fires, the overlay is already fully opaque. No hard cut.
+    video.addEventListener('timeupdate', function () {
+      var refs = video._livePhotoRefs;
+      if (!refs || refs.fadingIn) return;
+
+      var remaining = (video.duration - video.currentTime) * 1000;
+      if (remaining <= FADE_DURATION && remaining > 0) {
+        refs.fadingIn = true;
+        fadeInOverlay(refs.overlay);
+      }
+    });
+
+    // --- Ended handler ---
+    // Safari bug: .paused stays false after ended fires.
+    // Explicit pause() is a defensive measure.
+    // If looping: dwell on the still, then replay.
+    // If not looping: poster stays visible.
+    video.addEventListener('ended', function () {
+      video.pause();
+      var refs = video._livePhotoRefs;
+      if (!refs) return;
+
+      // If timeupdate missed the fade window, fade in now
+      if (!refs.fadingIn) {
+        fadeInOverlay(refs.overlay);
+      }
+      refs.fadingIn = false;
+
+      // Loop with dwell: hold the still, then replay
+      if (refs.shouldLoop) {
+        refs.loopTimeout = setTimeout(function () {
+          refs.loopTimeout = null;
+          // Only replay if still in viewport (observer would have
+          // cancelled the timeout if scrolled away)
+          if (video.paused) {
+            startPlayCycle(video);
+          }
+        }, LOOP_DWELL);
+      }
+    });
+
+    // --- Reduced motion: static frame, no observers ---
+    if (prefersReducedMotion) {
+      video.pause();
+      return;
+    }
+
+    // --- Register with both observers ---
+    preloadObserver.observe(video);
+    playObserver.observe(video);
+  }
+
+  function processVideo(video) {
+    if (video.closest('.live-photo')) return;
+
+    if (video.readyState >= 1) {
+      if (isShortVideo(video)) {
+        transformLivePhoto(video);
+      }
+      return;
+    }
+
+    // Mobile Safari defers preload="metadata" until user interaction
+    // or visibility. Set preload="auto" here to force metadata fetch
+    // and break the circular dependency. transformLivePhoto will reset
+    // it to "none" once it runs, then the preload observer manages it.
+    if (video.readyState === 0) {
+      video.setAttribute('preload', 'auto');
+    }
+
+    video.addEventListener(
+      'loadedmetadata',
+      function () {
+        if (isShortVideo(video)) {
+          transformLivePhoto(video);
+        }
+      },
+      { once: true }
+    );
+  }
+
+  function init() {
+    var videos = document.querySelectorAll('.kg-video-card video');
+    for (var i = 0; i < videos.length; i++) {
+      processVideo(videos[i]);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  // --- Real-time reduced motion toggle ---
+  // Iterates cached array instead of re-querying DOM.
+  window
+    .matchMedia('(prefers-reduced-motion: reduce)')
+    .addEventListener('change', function (e) {
+      prefersReducedMotion = e.matches;
+      for (var i = 0; i < livePhotos.length; i++) {
+        var video = livePhotos[i];
+        var refs = video._livePhotoRefs;
+        if (e.matches) {
+          cancelPendingLoop(refs);
+          video.pause();
+          if (refs && refs.overlay) fadeInOverlay(refs.overlay);
+        } else {
+          playObserver.observe(video);
+        }
+      }
+    });
+})();
+</script>
